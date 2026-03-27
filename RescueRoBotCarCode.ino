@@ -24,18 +24,19 @@ const int PWM_FREQ = 20000;
 const int PWM_RES  = 8;    
 
 uint8_t manualSpeed = 255; 
-uint8_t autoSpeed   = 200;  // Tăng tốc độ để xe vượt qua quán tính, không bị ì
+uint8_t autoSpeed   = 200;  
 int GAS_FLEE        = 1800; 
 int GAS_TRACK       = 800;  
 
 int currentMode = 0; 
-// 0: Manual (Điều khiển tay + Servo)
+// 0: Manual 
 // 1: BÁM TƯỜNG (Wall Follower SLAM)
 // 2: TÌM GAS (Bám tường + Sniffing)
 // 3: BỎ CHẠY (Bám tường + Flee)
 // 4: NÉ VẬT CẢN (Quét Radar Trái/Phải/Quay đầu)
 
 unsigned long lastPingTime = 0;
+bool hasConnected = false; // CỜ TRẠNG THÁI: Xác định xe đã từng kết nối web chưa
 char currentManualCmd = 's'; 
 
 // Non-blocking Timers
@@ -46,8 +47,8 @@ unsigned long oTimer = 0;
 enum WallState { LOOK_FRONT, LOOK_LEFT, DO_MOVE, TURN_RIGHT, TURN_LEFT, FLEEING, SNIFF_L, SNIFF_R, SNIFF_FWD };
 WallState wState = LOOK_FRONT;
 
-// Trạng thái Né Vật Cản (Mode 4)
-enum ObsState { O_FWD, O_SCAN_R, O_SCAN_L, O_DECIDE, O_TURN };
+// Trạng thái Né Vật Cản (Cải tiến với bước lùi lại - O_BACKWARD)
+enum ObsState { O_FWD, O_BACKWARD, O_SCAN_R, O_SCAN_L, O_DECIDE, O_TURN };
 ObsState oState = O_FWD;
 int oTurnDir = 0; // 3: Trái, 4: Phải, 5: Quay đầu
 
@@ -61,7 +62,7 @@ Servo radarServo;
 float distLeft = 0;
 float distRight = 0;
 float distFront = 0;
-int currentServoAngle = 90;
+int currentServoAngle = 135; // TÂM CHO SERVO 270 ĐỘ (270 / 2)
 
 int sniffLeftGas = 0;
 int sniffRightGas = 0;
@@ -82,6 +83,8 @@ const char index_html[] PROGMEM = R"=====(
   .mode-btn { width: 48%; padding: 8px; font-size: 11px; font-weight: bold; border-radius: 5px; border:none; cursor: pointer; margin: 2px; }
   .mode-active { background: #00aaff; color: #fff; box-shadow: 0 0 10px #00aaff;}
   .mode-off { background: #444; color: #aaa; }
+  .btn-refresh { background: #ff5555; color: white; width: 98%; margin-top: 5px; }
+  .btn-refresh:active { background: #cc0000; }
   .slider { width: 100%; margin-top: 5px; }
   #map-wrapper { background: #000; border: 2px solid #555; width: 100%; height: 250px; position: relative; overflow: hidden; margin-top: 5px; border-radius: 5px;}
   canvas { background: transparent; display: block; width: 100%; height: 100%;}
@@ -115,20 +118,21 @@ const char index_html[] PROGMEM = R"=====(
     <div><button class="btn" onmousedown="cmd('b')" onmouseup="cmd('s')" ontouchstart="cmd('b')" ontouchend="cmd('s')">BWD</button></div>
     
     <div style="font-size: 12px; margin-top:8px; text-align: left;">
-      <b>Radar Angle (Chỉ dùng ở Mode 0):</b> <span id="ang-val">90</span>&deg;
-      <input type="range" min="0" max="180" value="90" class="slider" id="servoSlider" onchange="fetch('/servo?ang='+this.value); document.getElementById('ang-val').innerText=this.value;">
+      <b>Radar Angle (Chỉ dùng Mode 0):</b> <span id="ang-val">135</span>&deg;
+      <input type="range" min="0" max="270" value="135" class="slider" id="servoSlider" onchange="fetch('/servo?ang='+this.value); document.getElementById('ang-val').innerText=this.value;">
     </div>
   </div>
 
   <div class="panel" style="padding: 5px;">
     <h3 style="margin:2px 0; font-size: 12px; color:#fff;">Live SLAM Map</h3>
+    <button class="mode-btn btn-refresh" onclick="refreshMap()">🔄 REFRESH DATA & MAP</button>
     <div id="map-wrapper"><canvas id="slamMap" width="400" height="400"></canvas></div>
     <div class="legend">🟦 Đường đi | ⬜ Tường | 🔴 Nguy hiểm (>800)</div>
   </div>
 
 <script>
   let currentCmd = 's';
-  let servoAng = 90;
+  let servoAng = 135;
   const canvas = document.getElementById('slamMap');
   const ctx = canvas.getContext('2d');
   let robX = 200, robY = 200, heading = 0; 
@@ -144,6 +148,17 @@ const char index_html[] PROGMEM = R"=====(
       if(btn) btn.className = (m==i) ? 'mode-btn mode-active' : 'mode-btn mode-off';
     }
     document.getElementById('servoSlider').disabled = (m != 0);
+  }
+
+  // Chức năng Refresh toàn bộ dữ liệu
+  function refreshMap() {
+    robX = 200; robY = 200; heading = 0;
+    path = [{x: 200, y: 200}];
+    walls = [];
+    gasZones = [];
+    maxGas = 0;
+    cmd('s'); // Dừng xe
+    drawMap();
   }
 
   function drawMap() {
@@ -186,7 +201,8 @@ const char index_html[] PROGMEM = R"=====(
       if(moved) path.push({x: robX, y: robY});
 
       if(d.dist < 60 && d.dist > 2) {
-        let absAngle = heading + (servoAng - 90); 
+        // Cập nhật lại logic góc chiếu bản đồ cho tâm 135
+        let absAngle = heading + (servoAng - 135); 
         let rad = absAngle * Math.PI / 180;
         let wallX = robX + Math.sin(rad) * (d.dist/2); 
         let wallY = robY - Math.cos(rad) * (d.dist/2);
@@ -199,7 +215,7 @@ const char index_html[] PROGMEM = R"=====(
         gasZones.push({x: maxGasPos.x, y: maxGasPos.y, r: Math.min(maxGas / 30, 60)}); maxGas = 0; 
       }
       drawMap();
-    });
+    }).catch(e => console.log('Ping failed')); 
   }, 500); 
 </script></body></html>
 )=====";
@@ -249,6 +265,8 @@ void readSensors() {
 void handleRoot() { server.send_P(200, "text/html", index_html); }
 void handlePing() {
   lastPingTime = millis(); 
+  hasConnected = true; // Đánh dấu là đã có kết nối web
+  
   String action = "s";
   if(currentMode >= 1 && currentMode <= 3) {
     if(wState == DO_MOVE || wState == SNIFF_FWD) action = "f"; 
@@ -257,6 +275,7 @@ void handlePing() {
     else if(wState == TURN_RIGHT || wState == SNIFF_R) action = "r";
   } else if (currentMode == 4) {
     if(oState == O_FWD) action = "f";
+    else if(oState == O_BACKWARD) action = "b";
     else if(oState == O_TURN && oTurnDir == 3) action = "l";
     else if(oState == O_TURN && oTurnDir == 4) action = "r";
     else if(oState == O_TURN && oTurnDir == 5) action = "b";
@@ -277,33 +296,42 @@ void handleServo() {
 void handleMode() {
   if (server.hasArg("m")) {
     currentMode = server.arg("m").toInt();
-    wState = LOOK_FRONT; oState = O_FWD; drive(0, 0); setRadar(90);
+    wState = LOOK_FRONT; oState = O_FWD; drive(0, 0); setRadar(135);
   }
   server.send(200, "text/plain", "OK");
 }
 
-// ========== MODE 4: NÉ VẬT CẢN (QUÉT TRÁI PHẢI TÌM ĐƯỜNG) ==========
+// ========== MODE 4: NÉ VẬT CẢN (CẢI TIẾN THEO LOGIC MỚI LÙI TRƯỚC KHI QUÉT) ==========
 void handleObstacleAvoidance() {
   unsigned long now = millis();
 
   switch (oState) {
     case O_FWD:
-      setRadar(90);
+      setRadar(135); // Tâm servo 270 là 135
       drive(1, autoSpeed); // Đi thẳng
-      if (now - oTimer > 150) { // Check liên tục
+      if (now - oTimer > 150) { 
         if (currentDist > 0 && currentDist < 30.0) {
-          drive(0,0); // Phanh gấp
-          oState = O_SCAN_R;
+          drive(2, autoSpeed); // Lập tức lùi nhẹ thay vì chỉ phanh
+          oState = O_BACKWARD;
           oTimer = now;
         } else {
-          oTimer = now; // Reset timer để đi tiếp
+          oTimer = now; 
         }
       }
       break;
 
+    case O_BACKWARD:
+      // Lùi lại 250ms giống code của bạn để tăng góc nhìn
+      if (now - oTimer > 250) {
+        drive(0,0); // Dừng lại
+        oState = O_SCAN_R;
+        oTimer = now;
+      }
+      break;
+
     case O_SCAN_R:
-      setRadar(10); // Quay sang nhìn phải
-      if (now - oTimer > 400) { // Đợi cơ học 0.4s
+      setRadar(45); // 135 - 90 = 45 (Nhìn phải vuông góc)
+      if (now - oTimer > 400) { 
         distRight = getDistanceCm();
         oState = O_SCAN_L;
         oTimer = now;
@@ -311,8 +339,8 @@ void handleObstacleAvoidance() {
       break;
 
     case O_SCAN_L:
-      setRadar(170); // Quay sang nhìn trái
-      if (now - oTimer > 500) { // Đợi servo đi từ Phải sang Trái (xa hơn)
+      setRadar(225); // 135 + 90 = 225 (Nhìn trái vuông góc)
+      if (now - oTimer > 500) { 
         distLeft = getDistanceCm();
         oState = O_DECIDE;
         oTimer = now;
@@ -320,10 +348,10 @@ void handleObstacleAvoidance() {
       break;
 
     case O_DECIDE:
-      setRadar(90); // Trả thẳng cổ
+      setRadar(135); // Trả thẳng cổ
       if (distLeft < 25.0 && distRight < 25.0) {
-        oTurnDir = 5; // Cả 2 bên đều kẹt -> Quay đầu
-        drive(4, autoSpeed + 20); // Xoay phải mạnh
+        oTurnDir = 5; // Cả 2 bên kẹt -> Quay đầu
+        drive(4, autoSpeed + 20); 
       } else if (distRight >= distLeft) {
         oTurnDir = 4; // Phải rộng hơn -> Rẽ phải
         drive(4, autoSpeed + 20);
@@ -336,7 +364,7 @@ void handleObstacleAvoidance() {
       break;
 
     case O_TURN:
-      int turnWait = (oTurnDir == 5) ? 900 : 450; // Quay đầu cần thời gian gấp đôi rẽ 90 độ
+      int turnWait = (oTurnDir == 5) ? 900 : 450; 
       if (now - oTimer > turnWait) {
         drive(0,0);
         oState = O_FWD;
@@ -351,11 +379,11 @@ void handleWallFollower(bool canSniff, bool canFlee) {
   unsigned long now = millis();
 
   if (canFlee && currentGas > GAS_FLEE && wState != FLEEING) { wState = FLEEING; wTimer = now; }
-  if (canSniff && currentGas > GAS_TRACK && wState < SNIFF_L) { wState = SNIFF_L; wTimer = now; setRadar(90); drive(0,0); }
+  if (canSniff && currentGas > GAS_TRACK && wState < SNIFF_L) { wState = SNIFF_L; wTimer = now; setRadar(135); drive(0,0); }
 
   switch (wState) {
     case LOOK_FRONT:
-      setRadar(90);
+      setRadar(135); // Cổ thẳng
       if (now - wTimer > 300) { 
         distFront = getDistanceCm();
         if (distFront > 0 && distFront < 20.0) { 
@@ -367,7 +395,7 @@ void handleWallFollower(bool canSniff, bool canFlee) {
       break;
 
     case LOOK_LEFT:
-      setRadar(180);
+      setRadar(225); // Vuông góc bên trái
       if (now - wTimer > 300) { 
         distLeft = getDistanceCm();
         wState = DO_MOVE; wTimer = now;
@@ -375,17 +403,17 @@ void handleWallFollower(bool canSniff, bool canFlee) {
       break;
 
     case DO_MOVE:
-      if (distLeft > 0 && distLeft < 10.0) drive(4, autoSpeed + 20); // Gần tường -> Ép phải mạnh
-      else if (distLeft > 25.0 && distLeft < 50.0) drive(3, autoSpeed + 20); // Xa tường -> Ôm trái
-      else drive(1, autoSpeed + 30); // Tốc độ chạy thẳng cao hơn xíu
+      if (distLeft > 0 && distLeft < 10.0) drive(4, autoSpeed + 20); // Ép phải
+      else if (distLeft > 25.0 && distLeft < 50.0) drive(3, autoSpeed + 20); // Ôm trái
+      else drive(1, autoSpeed + 30); 
 
-      if (now - wTimer > 800) { // TĂNG LÊN 0.8s ĐỂ XE VƯỢT QUÁN TÍNH CHẮC CHẮN DI CHUYỂN ĐƯỢC
+      if (now - wTimer > 800) { 
         drive(0,0); wState = LOOK_FRONT; wTimer = now;
       }
       break;
 
     case TURN_RIGHT:
-      drive(4, autoSpeed + 30); // Lực xoay mạnh trên gạch
+      drive(4, autoSpeed + 30); 
       if (now - wTimer > 600) { drive(0,0); wState = LOOK_FRONT; wTimer = now; }
       break;
 
@@ -422,10 +450,13 @@ void setup() {
   ledcAttach(ENA_PIN, PWM_FREQ, PWM_RES);
   ledcAttach(ENB_PIN, PWM_FREQ, PWM_RES);
 
+  // Khởi tạo PWM về 0 ngay từ đầu để chống trôi motor
+  setMotor(0,0);
+
   ESP32PWM::allocateTimer(2); ESP32PWM::allocateTimer(3);
   radarServo.setPeriodHertz(50); 
   radarServo.attach(SERVO_PIN, 500, 2400); 
-  radarServo.write(90); 
+  radarServo.write(135); // Tâm 135
 
   pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT); pinMode(MQ2_PIN, INPUT);
 
@@ -441,12 +472,22 @@ void loop() {
   readSensors();
   unsigned long now = millis();
 
-  if (now - lastPingTime > 2500) { drive(2, autoSpeed); return; } // Mất sóng
+  // === LOGIC BẢO VỆ MỚI (FAILSAFE) ===
+  if (now - lastPingTime > 2500) { 
+    if (hasConnected) {
+      // Đã từng kết nối nhưng mất sóng -> Lùi thoát hiểm
+      drive(2, autoSpeed); 
+    } else {
+      // Chưa từng kết nối (mới bật nguồn) -> Đứng im an toàn
+      drive(0, 0); 
+    }
+    return; // Dừng việc thực thi các mode bên dưới
+  } 
 
   if (currentMode == 1) handleWallFollower(false, false); 
   else if (currentMode == 2) handleWallFollower(true, false);  
   else if (currentMode == 3) handleWallFollower(false, true);  
-  else if (currentMode == 4) handleObstacleAvoidance(); // Chạy Mode 4: Né Vật Cản
+  else if (currentMode == 4) handleObstacleAvoidance(); 
   else {
     // Mode 0: Manual
     if (currentManualCmd == 'f') drive(1, manualSpeed);
@@ -456,4 +497,5 @@ void loop() {
     else drive(0, 0);
   }
 }
+
 
